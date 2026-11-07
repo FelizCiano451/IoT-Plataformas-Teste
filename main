@@ -1,0 +1,176 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// --- PINOS E CONFIGURAÇÕES DOS SENSORES E LEDS ---
+#define PIN_SENSOR_PIR 2       // Pino digital do HC-SR501
+#define PIN_SENSOR_DHT 4       // Pino digital do DHT11
+#define TIPO_DHT DHT11         
+
+// Três LEDs indicativos para cada um dos sensores (conforme solicitado)
+#define LED_TEMPERATURA 23     
+#define LED_UMIDADE 22         
+#define LED_PRESENCA 21        
+
+DHT dht(PIN_SENSOR_DHT, TIPO_DHT);
+
+// --- CREDENCIAIS E CONFIGURAÇÕES MQTT ---
+const char* ssid = "NOME_ROTEADOR";         // Nome do roteador Wi-Fi
+const char* password = "SENHA_ROTEADOR";     // Senha do roteador Wi-Fi
+
+const char* mqtt_server = "END_IP_BROKER";   // Endereço IP ou domínio do broker
+const int mqtt_port = 1883;                  // Porta do serviço MQTT
+const char* un = "USUARIO_BROKER";           // Nome de usuário para autenticação
+const char* pw = "SENHA_BROKER";             // Senha da autenticação
+const char* id = "ID_ESP32";                 // Identificador único do seu ESP
+
+// --- TÓPICOS DE PUBLICAÇÃO (Sensores) ---
+const char* topico_movimento = "iot/projeto/movimento";
+const char* topico_temperatura = "iot/projeto/temperatura";
+const char* topico_umidade = "iot/projeto/umidade";
+
+// --- TÓPICOS DE SUSCRIÇÃO (Comandos vindos do Node-RED para os LEDs) ---
+const char* topico_cmd_temp = "iot/projeto/cmd/led_temperatura";
+const char* topico_cmd_umi  = "iot/projeto/cmd/led_umidade";
+const char* topico_cmd_pres = "iot/projeto/cmd/led_presenca";
+
+WiFiClient espClient;                       // Cria o cliente WiFi
+PubSubClient client(espClient);             // Informa ao cliente MQTT qual o cliente WiFi deve ser usado
+
+unsigned long ultimoTempoTentativa = 0;
+const long intervaloTentativa = 5000;
+unsigned long ultimaLeituraSensores = 0;
+const long intervaloLeitura = 2000;         // Leitura periódica estável a cada 2 segundos
+
+// --- FUNÇÃO DE CALLBACK: Recebe os comandos processados pelo Node-RED ---
+void callback(char* topic, byte* payload, unsigned int length) {
+  // Converte o payload recebido para string para facilitar a comparação
+  String mensagem = "";
+  for (unsigned int i = 0; i < length; i++) {
+    mensagem += (char)payload[i];
+  }
+
+  Serial.print("Comando recebido do Node-RED [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  Serial.println(mensagem);
+
+  // O Node-RED decide e envia o comando ("1" para ligar, "0" para desligar)
+  uint8_t estado = (mensagem == "1") ? HIGH : LOW;
+
+  if (strcmp(topic, topico_cmd_temp) == 0) {
+    digitalWrite(LED_TEMPERATURA, estado);
+  } 
+  else if (strcmp(topic, topico_cmd_umi) == 0) {
+    digitalWrite(LED_UMIDADE, estado);
+  } 
+  else if (strcmp(topic, topico_cmd_pres) == 0) {
+    digitalWrite(LED_PRESENCA, estado);
+  }
+}
+
+// --- CONEXÃO WI-FI ---
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Conectando a ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi conectado!");
+  Serial.print("Endereço IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// --- RECONEXÃO MQTT E INSCRIÇÕES NOS TÓPICOS DE COMANDO ---
+void reconnect() {
+  if (!client.connected()) {
+    unsigned long agora = millis();
+    if (agora - ultimoTempoTentativa >= intervaloTentativa) {
+      ultimoTempoTentativa = agora;
+      
+      bool mqttConectado = client.connect(id, un, pw);
+
+      if (mqttConectado) {
+        Serial.println("Conectado ao Broker MQTT!");
+        
+        // Inscreve-se nos tópicos onde o Node-RED enviará os comandos processados
+        client.subscribe(topico_cmd_temp);
+        client.subscribe(topico_cmd_umi);
+        client.subscribe(topico_cmd_pres);
+        
+        client.publish("iot/projeto/status", "ESP32 online e pronto");
+      } else {
+        Serial.println();
+        Serial.print("Falha na conexão MQTT, rc=");
+        Serial.print(client.state());
+        Serial.println(" Tentando novamente em 5 segundos...");
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Configuração dos pinos dos sensores
+  pinMode(PIN_SENSOR_PIR, INPUT);
+  
+  // Configuração dos pinos dos três LEDs como saída
+  pinMode(LED_TEMPERATURA, OUTPUT);
+  pinMode(LED_UMIDADE, OUTPUT);
+  pinMode(LED_PRESENCA, OUTPUT);
+
+  dht.begin();
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback); 
+}
+
+void loop() {
+  // Garante a conexão MQTT ativa sem travar o ESP32
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  // Leitura periódica estável sem usar delay() travante
+  unsigned long tempoAtual = millis();
+  if (tempoAtual - ultimaLeituraSensores >= intervaloLeitura) {
+    ultimaLeituraSensores = tempoAtual;
+
+    // --- VARIÁVEIS TEMPORÁRIAS NO ESP32 ---
+    int movimentoDetectado = digitalRead(PIN_SENSOR_PIR);
+    float temperaturaAtual = dht.readTemperature();
+    float umidadeAtual = dht.readHumidity();
+
+    // Validação da leitura periódica dos sensores
+    if (!isnan(temperaturaAtual) && !isnan(umidadeAtual)) {
+      char payloadMovimento[10];
+      sprintf(payloadMovimento, "%d", movimentoDetectado);
+      
+      char payloadTemp[10];
+      dtostrf(temperaturaAtual, 4, 2, payloadTemp);
+      
+      char payloadUmi[10];
+      dtostrf(umidadeAtual, 4, 2, payloadUmi);
+
+      // Publica os dados crus para o Node-RED processar
+      client.publish(topico_movimento, payloadMovimento);
+      client.publish(topico_temperatura, payloadTemp);
+      client.publish(topico_umidade, payloadUmi);
+      
+      Serial.println("Leituras enviadas ao Broker para processamento no Node-RED.");
+    } else {
+      Serial.println("Erro na leitura do sensor DHT11.");
+    }
+  }
+}
